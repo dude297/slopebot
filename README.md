@@ -46,7 +46,15 @@ NOSTEER=1 python bot.py 120
 KD=0.15 DEAD=3 python bot.py 120
 REACT=0 python probe.py
 REACT=1 python explore.py
+RUNS=20 python bot.py 3600      # stop after 20 finished runs (experiment protocol)
+HUMAN=1 python bot.py 300       # you play; keys + perception + frames are recorded
+python analyze.py --latest      # survival stats + death categories for the last session
+python replay.py --check fixtures/fixtures.json
 ```
+
+Windows PowerShell: `.venv\Scripts\activate`, and set env vars as `$env:RUNS="20"; python bot.py 3600`.
+
+Every session writes telemetry to `telemetry/<timestamp>/`; see `docs/TELEMETRY.md`.
 
 ## Files
 

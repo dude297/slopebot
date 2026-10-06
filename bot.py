@@ -1,7 +1,7 @@
 """Slope bot: reads the Unity WebGL canvas in-page, steers with arrow keys.
 Run: python bot.py [seconds]
 """
-import sys, time, os
+import sys, time, os, json, base64, subprocess
 from playwright.sync_api import sync_playwright
 
 GAME = "https://slopeio.org/game/slope-gm/"  # real game, unwrapped from slopeio.org -> yoplay.io iframes
@@ -15,6 +15,12 @@ HTMLCanvasElement.prototype.getContext = function(t, a) {
   if (t && t.startsWith('webgl')) a = Object.assign({}, a, {preserveDrawingBuffer: true});
   return orig.call(this, t, a);
 };
+// human key state for HUMAN=1 demonstrations: window._hk = -1 left, 0, 1 right
+window._hk = 0;
+const HK = {ArrowLeft: -1, KeyA: -1, ArrowRight: 1, KeyD: 1}, hkDown = new Set();
+const hkUpd = () => { let v = 0; for (const c of hkDown) v += HK[c]; window._hk = Math.sign(v); };
+addEventListener('keydown', e => { if (HK[e.code]) { hkDown.add(e.code); hkUpd(); } }, true);
+addEventListener('keyup', e => { if (HK[e.code]) { hkDown.delete(e.code); hkUpd(); } }, true);
 """
 
 # Two boundaries, sampled in a frame rotated about the ball (camera rolls on slopes/curves):
@@ -25,6 +31,7 @@ HTMLCanvasElement.prototype.getContext = function(t, a) {
 #  2. OBSTACLES: red runs within LOOK px ahead, padded by ~ball radius.
 # Safe zone per row = track minus padded red; walk forward picking the gap nearest the path.
 SENSE = f"""(REACT) => {{
+  const T0 = performance.now();
   const BX={BALL_X}, BY={BALL_Y}, U={UNIT}, LOOK=100, STRAIGHT=!REACT;
   const src = document.querySelector('#unity-canvas');
   const C = window._fc || (window._fc = Object.assign(document.createElement('canvas'), {{width: 960, height: 540}}));
@@ -118,7 +125,8 @@ SENSE = f"""(REACT) => {{
                       [...px(track[1](-LOOK), -LOOK, th), ...px(track[1](210), 210, th)]] : null;
   const nearU = path.length ? (path[0][0] - BX) : 0;
   return {{black, over, score1: one, err: target / U, near: nearU / U, block, track: !!track, tunnel, nt: pts.length,
-          th: Math.round(th * 57.3), road: pts.length > 0 || anyRed, ov: {{path, reds, tr}}}};
+          th: Math.round(th * 57.3), road: pts.length > 0 || anyRed,
+          track_age: window._trk ? window._trk.age : null, sense_ms: performance.now() - T0, ov: {{path, reds, tr}}}};
 }}"""
 
 
@@ -140,8 +148,67 @@ OVERLAY = """({path, reds, tr}) => {
 }"""
 
 
+RUNS = int(os.environ.get("RUNS", 0))   # stop after N finished runs (0 = run for `seconds`)
+# HUMAN=1: you play in the browser window, the bot only records (your keys -> cmd, phase "human")
+HUMAN = os.environ.get("HUMAN") == "1"
+# pre-death buffer: 40 frames every 2nd tick (~2.5 s); human demos keep every 3rd frame of the whole run
+RING_N, RING_EVERY = (100000, 3) if HUMAN else (40, 2)
+
+# SENSE + rolling pre-death frame buffer (480x270 jpeg, in page) in one round trip
+TICK = "(a) => { const s = (" + SENSE + """)(a.react);
+  if (a.ring) { const src = document.querySelector('#unity-canvas');
+    const c = window._rc || (window._rc = Object.assign(document.createElement('canvas'), {width: 480, height: 270}));
+    c.getContext('2d').drawImage(src, 0, 0, 480, 270);
+    const r = window._ring || (window._ring = []); r.push([a.i, a.t, c.toDataURL('image/jpeg', 0.6)]);
+    if (r.length > %d) r.shift(); }
+  s.hk = window._hk || 0; return s; }""" % RING_N
+TAKE_RING = "() => { const r = window._ring || []; window._ring = []; return r; }"
+
+
+class Telemetry:
+    """telemetry/<session>/: session.json, run_NNN.jsonl (per tick), run_NNN_pre/ (pre-death frames),
+    run_NNN_death.png, summary.jsonl. Schema documented in docs/TELEMETRY.md."""
+
+    def __init__(self):
+        self.sid = time.strftime("%Y%m%d-%H%M%S")
+        self.dir = os.path.join("telemetry", self.sid)
+        os.makedirs(self.dir, exist_ok=True)
+        try: commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        except OSError: commit = ""
+        dirty = bool(subprocess.run(["git", "status", "--porcelain", "bot.py"], capture_output=True, text=True).stdout.strip())
+        with open(os.path.join(self.dir, "session.json"), "w") as f:
+            json.dump({"session_id": self.sid, "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "commit": commit + ("-dirty" if dirty else ""),
+                       "params": {"KD": KD, "DEAD": DEAD, "NOSTEER": NOSTEER, "DEBUG": DEBUG, "HUMAN": HUMAN}, "viewport": [960, 540]}, f, indent=1)
+        self.f = None
+
+    def start(self, run):
+        self.run, self.rows, self.last_cmd, self.reversals = run, 0, 0, 0
+        self.loop_sum = 0.0
+        self.f = open(os.path.join(self.dir, f"run_{run:03d}.jsonl"), "w")
+
+    def tick(self, rec):
+        self.f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self.rows += 1; self.loop_sum += rec["loop_ms"]
+        if rec["cmd"] and self.last_cmd and rec["cmd"] != self.last_cmd: self.reversals += 1
+        if rec["cmd"]: self.last_cmd = rec["cmd"]
+
+    def end(self, pg, duration, react_at, how):
+        self.f.close(); self.f = None
+        pre = os.path.join(self.dir, f"run_{self.run:03d}_pre"); os.makedirs(pre, exist_ok=True)
+        idx = []
+        for k, (i, t, url) in enumerate(pg.evaluate(TAKE_RING)):
+            with open(os.path.join(pre, f"frame_{k:03d}.jpg"), "wb") as f: f.write(base64.b64decode(url.split(",", 1)[1]))
+            idx.append({"i": i, "t": t})
+        with open(os.path.join(pre, "index.json"), "w") as f: json.dump(idx, f)
+        if how == "gameover": pg.screenshot(path=os.path.join(self.dir, f"run_{self.run:03d}_death.png"))
+        with open(os.path.join(self.dir, "summary.jsonl"), "a") as f:
+            f.write(json.dumps({"run": self.run, "duration": round(duration, 3), "react_at": react_at, "ticks": self.rows, "end": how,
+                                "mean_loop_ms": round(self.loop_sum / max(self.rows, 1), 2), "reversals": self.reversals}) + "\n")
+
+
 def main(seconds=120):
-    os.makedirs("deaths", exist_ok=True)
+    tel = Telemetry()
+    print(f"telemetry -> {tel.dir}")
     with sync_playwright() as p:
         b = p.chromium.launch(headless=False)
         pg = b.new_page(viewport={"width": 960, "height": 540})
@@ -150,24 +217,30 @@ def main(seconds=120):
         pg.wait_for_function("window.unityInstance", timeout=90000)
         pg.wait_for_timeout(6000)
 
-        held, runs, run_start, last_click, react = None, 0, None, 0, False
-        t0 = time.time()
-        while time.time() - t0 < seconds:
-            s = pg.evaluate(SENSE, react)
+        held, runs, run_start, last_click, react, ticks = None, 0, None, 0, False, 0
+        t0 = last_tick = time.time()
+        while time.time() - t0 < seconds and not (RUNS and runs >= RUNS):
+            tick_start = time.time()
+            rt = tick_start - run_start if run_start else 0.0
+            s = pg.evaluate(TICK, {"react": react, "ring": run_start is not None and ticks % RING_EVERY == 0, "i": ticks, "t": round(rt, 3)})
             if s["over"] or (run_start is None and s["black"] > 0.78):  # GAMEOVER, or menu before a run
                 if held: pg.keyboard.up(held); held = None
                 if run_start and s["over"]:
                     runs += 1
                     sw = f"bot from {react_at - run_start:.1f}s" if react else "never reached score 1"
                     print(f"run {runs}: {time.time() - run_start:.1f}s ({sw})")
-                    pg.screenshot(path=f"deaths/run{runs:03d}.png")
+                    tel.end(pg, time.time() - run_start, round(react_at - run_start, 3) if react else None, "gameover")
                     run_start = None
                 if time.time() - last_click > 1.5:
                     pg.mouse.click(480, 310, delay=100)
                     last_click = time.time()
                 continue
             now = time.time()
-            if run_start is None: run_start = now; ticks = 0; prev = (now, s["near"]); react = False
+            if run_start is None:
+                run_start = now; ticks = 0; prev = (now, s["near"]); react = HUMAN  # human: full sensing from t=0
+                if HUMAN: react_at = now
+                pg.evaluate("() => { window._ring = []; window._trk = null; }")
+                tel.start(runs + 1)
             ticks += 1
             # phase 1: roll straight (predictable) until score shows 1; phase 2: reactive bot
             if not react and s["score1"]: react, react_at = True, now; print(f"  score 1 at {now - run_start:.1f}s -> reactive bot on")
@@ -176,7 +249,8 @@ def main(seconds=120):
             vel = (s["near"] - prev[1]) / dt
             prev = (now, s["near"])
             u = s["err"] + KD * vel
-            steer = 0 if NOSTEER or not react or abs(u) < DEAD else (1 if u > 0 else -1)
+            bot_cmd = 0 if abs(u) < DEAD else (1 if u > 0 else -1)  # what the controller wants
+            steer = 0 if HUMAN or NOSTEER or not react else bot_cmd
             if DEBUG and runs < 6:
                 pg.evaluate(OVERLAY, s["ov"])
                 pg.screenshot(path=f"exp/r{runs}_{ticks:03d}.jpg", type="jpeg", quality=60)
@@ -186,6 +260,16 @@ def main(seconds=120):
                 if held: pg.keyboard.up(held)
                 if want: pg.keyboard.down(want)
                 held = want
+            tel.tick({"i": ticks, "t": round(now - run_start, 3), "phase": "human" if HUMAN else "react" if react else "straight",
+                      "err": round(s["err"], 2), "near": round(s["near"], 2), "vel": round(vel, 2), "u": round(u, 2),
+                      "cmd": s["hk"] if HUMAN else steer, "bot_cmd": bot_cmd,
+                      "track": s["track"], "track_age": s["track_age"], "nt": s["nt"], "tunnel": s["tunnel"], "block": s["block"],
+                      "road": s["road"], "black": round(s["black"], 3), "sense_ms": round(s["sense_ms"], 2),
+                      "loop_ms": round((time.time() - last_tick) * 1000, 1)})
+            last_tick = time.time()
+        if run_start:  # session ended mid-run
+            if held: pg.keyboard.up(held)
+            tel.end(pg, time.time() - run_start, round(react_at - run_start, 3) if react else None, "timeout")
         b.close()
 
 

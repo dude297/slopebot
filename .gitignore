@@ -3,3 +3,4 @@ deaths/
 exp/
 *.png
 __pycache__/
+telemetry/
