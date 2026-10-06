@@ -6,7 +6,8 @@ from playwright.sync_api import sync_playwright
 
 GAME = "https://slopeio.org/game/slope-gm/"  # real game, unwrapped from slopeio.org -> yoplay.io iframes
 BALL_X, BALL_Y = 480, 330  # ball is camera-pinned here @960x540
-UNIT = 6                   # err reported in 1/6 px so KD/DEAD tuning stays as before
+NOSTEER = os.environ.get("NOSTEER") == "1"         # baseline: never press a key
+UNIT = 6                  # err reported in 1/6 px so KD/DEAD tuning stays as before
 
 INIT = """
 const orig = HTMLCanvasElement.prototype.getContext;
@@ -16,91 +17,125 @@ HTMLCanvasElement.prototype.getContext = function(t, a) {
 };
 """
 
-# Two boundaries:
-#  1. TRACK: road edges. Road grid lines are thick (13-35px) vs building lines (1-6px); take the outermost
-#     thick green runs in rows below the ball, fit lo(y)/hi(y) as straight lines, extrapolate ahead.
-#  2. OBSTACLES: red runs, padded by ~ball radius (pad grows toward the camera).
-# Safe zone per row = track minus padded red. Walk rows from the ball forward, pick the safe gap
-# nearest the current path (wide gaps preferred), target = weighted mean of gap mids.
-SENSE = f"""() => {{
-  const BX={BALL_X}, BY={BALL_Y}, U={UNIT};
+# Two boundaries, sampled in a frame rotated about the ball (camera rolls on slopes/curves):
+#  u = lateral offset from ball (+ right), v = offset along screen-up axis (- ahead, + toward camera).
+#  1. TRACK: road crossbars = long green runs passing under the ball. Tilt = angle whose scanlines make
+#     them longest. Fit lo(v)/hi(v) through crossbar endpoints, extrapolate ahead.
+#     In the tunnel (red on both sides) the red walls are the track, crossbar fit is skipped.
+#  2. OBSTACLES: red runs within LOOK px ahead, padded by ~ball radius.
+# Safe zone per row = track minus padded red; walk forward picking the gap nearest the path.
+SENSE = f"""(REACT) => {{
+  const BX={BALL_X}, BY={BALL_Y}, U={UNIT}, LOOK=100, STRAIGHT=!REACT;
   const src = document.querySelector('#unity-canvas');
   const C = window._fc || (window._fc = Object.assign(document.createElement('canvas'), {{width: 960, height: 540}}));
-  const cx2 = C.getContext('2d', {{willReadFrequently: true}});
-  cx2.drawImage(src, 0, 0, 960, 540);
-  const d = cx2.getImageData(0, 0, 960, 540).data;
-  const R = (x, y) => {{ const i = (y*960+x)*4; return d[i] > 150 && d[i+1] < 100; }};
-  const G = (x, y) => {{ const i = (y*960+x)*4; return d[i+1] > 150 && d[i] < 100; }};
-  const runs = (y, f) => {{ const out = []; for (let x = 0; x < 960; ) {{ if (f(x, y)) {{ const s = x; while (x < 960 && f(x, y)) x++; out.push([s, x]); }} else x++; }} return out; }};
-
+  const g2 = C.getContext('2d', {{willReadFrequently: true}});
+  g2.drawImage(src, 0, 0, 960, 540);
+  const d = g2.getImageData(0, 0, 960, 540).data;
   let black = 0, n = 0;
   for (let i = 0; i < d.length; i += 64) {{ n++; if (d[i] + d[i+1] + d[i+2] < 40) black++; }}
   black /= n;
+  const isR = i => d[i] > 150 && d[i+1] < 100, isG = i => d[i+1] > 150 && d[i] < 100;
+  const gw = (y, a, b) => {{ let k = 0; for (let x = a; x < b; x++) if (isG((y*960 + x) * 4)) k++; return k; }};
+  // score digit top-centre: row 25 is above the tutorial text. "1" = ~9px bar, "0"/"2".. = ~30px box
+  // "1" = bar at x 472-488 with empty columns either side, on rows above (22,26) and below (62,66) the text
+  const one = [22, 26, 62, 66].every(y => gw(y, 472, 489) >= 7 && gw(y, 440, 470) === 0 && gw(y, 491, 520) === 0);
+  // GAMEOVER title text: ~120px green on rows 70/75 in x 320-640 (menu: 0, gameplay: <=32)
+  const over = black > 0.78 && gw(70, 320, 640) >= 90 && gw(75, 320, 640) >= 90;
 
-  // 1. track boundary
-  // crossbars: the road grid's horizontal lines are single long green runs spanning edge to edge
-  const pts = [];
-  for (let y = 335; y <= 535; y += 3) {{
-    const long = runs(y, G).filter(([a, b]) => b - a >= Math.max(80, 0.8 * (y - 250)));
-    if (long.length) {{ const [a, b] = long.reduce((p, q) => q[1] - q[0] > p[1] - p[0] ? q : p); pts.push([y, a, b]); }}
-  }}
-  // one crossbar only -> no slope info; add a point assuming edges converge to the vanishing point (480,250)
+  const px = (u, v, th) => {{ const c = Math.cos(th), s = Math.sin(th); return [BX + u*c - v*s, BY + u*s + v*c]; }};
+  // runs along the rotated scanline at offset v, in u coords
+  const runs = (v, f, th) => {{
+    const c = Math.cos(th), s = Math.sin(th), out = []; let st = null;
+    for (let u = -480; u <= 480; u++) {{
+      const x = Math.round(BX + u*c - v*s), y = Math.round(BY + u*s + v*c);
+      const on = x >= 0 && x < 960 && y >= 0 && y < 540 && f((y*960 + x) * 4);
+      if (on && st === null) st = u; else if (!on && st !== null) {{ out.push([st, u]); st = null; }}
+    }}
+    if (st !== null) out.push([st, 481]);
+    return out;
+  }};
+
+  // 1. track boundary: crossbars under the ball, best tilt
+  const bars = th => {{
+    const pts = [];
+    for (let v = 5; v <= 205; v += 4) {{
+      const min = Math.max(80, 0.8 * (v + 80));
+      const ok = runs(v, isG, th).filter(([a, b]) => b - a >= min && a <= 40 && b >= -40);
+      if (ok.length) {{ const [a, b] = ok.reduce((p, q) => q[1] - q[0] > p[1] - p[0] ? q : p); pts.push([v, a, b]); }}
+    }}
+    return pts;
+  }};
+  // ponytail: tilt fixed at 0; "longest run" tilt search locked onto diagonal building/rail lines.
+  // Rotated sampling kept so a real tilt estimate (e.g. from crossbar edge slope) can plug in here.
+  const th = 0, pts = bars(th);
+
+  // tunnel: red walls on both sides just ahead of the ball -> they define the track
+  let rl = 0, rrt = 0;
+  for (let v = -60; v <= 0; v += 10) for (const [a, b] of runs(v, isR, th)) {{ if (b < 0) rl++; if (a > 0) rrt++; }}
+  const tunnel = rl > 0 && rrt > 0;
+
+  // single crossbar -> no slope; assume edges converge 80px above the ball
   if (pts.length && pts[pts.length-1][0] - pts[0][0] < 30) {{
-    const [y, a, b] = pts[0], k = 60 / (y - 250);
-    pts.push([y - 60, a + (480 - a) * k, b + (480 - b) * k]);
+    const [v, a, b] = pts[0], k = 60 / (v + 80);
+    pts.push([v - 60, a * (1 - k), b * (1 - k)]);
   }}
-  const fit = k => {{  // least squares x = a + b*y
+  const fit = k => {{  // least squares u = a + b*v
     const m = pts.length, sy = pts.reduce((s, p) => s + p[0], 0), sx = pts.reduce((s, p) => s + p[k], 0);
     const syy = pts.reduce((s, p) => s + p[0]*p[0], 0), sxy = pts.reduce((s, p) => s + p[0]*p[k], 0);
-    const b = (m*sxy - sy*sx) / (m*syy - sy*sy || 1), a = (sx - b*sy) / m; return y => a + b*y;
+    const b = (m*sxy - sy*sx) / (m*syy - sy*sy || 1), a = (sx - b*sy) / m; return v => a + b*v;
   }};
   // ponytail: last-seen track reused for 10 frames when no crossbar is visible
   if (pts.length >= 2) window._trk = {{t: [fit(1), fit(2)], age: 0}};
   else if (window._trk) window._trk.age++;
-  const track = window._trk && window._trk.age < 10 ? window._trk.t : null;
+  const track = !tunnel && window._trk && window._trk.age < 10 ? window._trk.t : null;
 
   // 2. obstacle boundary + safe-gap walk
-  let cx = BX, ts = 0, tw = 0, block = -1;
+  let cu = 0, ts = 0, tw = 0, block = -1, anyRed = false;
   const path = [], reds = [];
-  for (let y = BY; y >= 240; y -= 6) {{
-    let lo = 0, hi = 959;
-    if (track) {{ lo = Math.max(0, track[0](y)); hi = Math.min(959, track[1](y)); const m = 0.12 * (hi - lo); lo += m; hi -= m; }}
-    const pad = 8 + 0.3 * (y - 240);
-    const rr = runs(y, R).map(([a, b]) => [a - pad, b + pad]);
-    rr.forEach(r => reds.push([y, r[0], r[1]]));
+  for (let v = 0; v >= -LOOK; v -= 5) {{
+    let lo = -480, hi = 480;
+    if (track) {{ lo = track[0](v); hi = track[1](v); const m = 0.12 * (hi - lo); lo += m; hi -= m; }}
+    const pad = 6 + 0.22 * (v + LOOK);
+    // STRAIGHT mode (milestone 1): lane-keeping only, red counts just as tunnel walls
+    const rr = STRAIGHT && !tunnel ? [] : runs(v, isR, th).map(([a, b]) => [a - pad, b + pad]);
+    if (rr.length) anyRed = true;
+    rr.forEach(([a, b]) => reds.push([...px(a, v, th), ...px(b, v, th)]));
     let gaps = [[lo, hi]];
     for (const [a, b] of rr) gaps = gaps.flatMap(([l, h]) => b <= l || a >= h ? [[l, h]] : [[l, a], [b, h]].filter(([p, q]) => q - p > 4));
-    if (!gaps.length) {{ path.push([y, cx]); continue; }}
-    if (block < 0 && !gaps.some(([l, h]) => l <= cx && cx <= h)) block = BY - y;
-    let best = null, bs = -1e9;
+    if (!gaps.length) {{ path.push(px(cu, v, th)); continue; }}
+    if (block < 0 && !gaps.some(([l, h]) => l <= cu && cu <= h)) block = -v;
+    let bg = null, bs = -1e9;
     for (const [l, h] of gaps) {{
-      const dist = cx < l ? l - cx : cx > h ? cx - h : 0, sc = (h - l) - 2 * dist;
-      if (sc > bs) {{ bs = sc; best = [l, h]; }}
+      const dist = cu < l ? l - cu : cu > h ? cu - h : 0, sc = (h - l) - 2 * dist;
+      if (sc > bs) {{ bs = sc; bg = [l, h]; }}
     }}
-    cx = (best[0] + best[1]) / 2;
-    const w = 1 + (y - 240) / 30;  // near rows matter more
-    ts += cx * w; tw += w; path.push([y, cx]);
+    cu = (bg[0] + bg[1]) / 2;
+    const w = 1 + (v + LOOK) / 25;  // near rows matter more
+    ts += cu * w; tw += w; path.push(px(cu, v, th));
   }}
-  const target = tw ? ts / tw : BX;
-  const tr = track ? [[240, track[0](240), track[1](240)], [540, track[0](540), track[1](540)]] : null;
-  return {{black, err: (target - BX) / U, near: (path[0][1] - BX) / U, block, track: !!track, nt: pts.length, ov: {{path, reds, tr}}}};
+  const target = tw ? ts / tw : 0;
+  const tr = track ? [[...px(track[0](-LOOK), -LOOK, th), ...px(track[0](210), 210, th)],
+                      [...px(track[1](-LOOK), -LOOK, th), ...px(track[1](210), 210, th)]] : null;
+  const nearU = path.length ? (path[0][0] - BX) : 0;
+  return {{black, over, score1: one, err: target / U, near: nearU / U, block, track: !!track, tunnel, nt: pts.length,
+          th: Math.round(th * 57.3), road: pts.length > 0 || anyRed, ov: {{path, reds, tr}}}};
 }}"""
 
 
 DEBUG = os.environ.get("DEBUG") == "1"
 KD = float(os.environ.get("KD", 0.15))   # seconds of look-ahead on lateral drift; tune per run
 DEAD = float(os.environ.get("DEAD", 3))  # deadband in err units
-# draws both boundaries over the game: magenta = track edges, red bars = padded obstacles, white = path
+# draws both boundaries over the game: magenta = track edges, orange = padded obstacles, white = path
 OVERLAY = """({path, reds, tr}) => {
   let o = document.querySelector('#dbg');
   if (!o) { o = Object.assign(document.createElement('canvas'), {id: 'dbg', width: 960, height: 540});
     o.style.cssText = 'position:fixed;left:0;top:0;pointer-events:none;z-index:9'; document.body.append(o); }
   const c = o.getContext('2d');
   c.clearRect(0, 0, 960, 540);
-  if (tr) { c.strokeStyle = '#f0f'; c.lineWidth = 4; c.beginPath();
-    c.moveTo(tr[0][1], tr[0][0]); c.lineTo(tr[1][1], tr[1][0]); c.moveTo(tr[0][2], tr[0][0]); c.lineTo(tr[1][2], tr[1][0]); c.stroke(); }
-  c.fillStyle = 'rgba(255,128,0,0.6)'; reds.forEach(([y, a, b]) => c.fillRect(a, y - 2, b - a, 4));
-  c.fillStyle = '#fff'; path.forEach(([y, x]) => c.fillRect(x - 4, y - 4, 8, 8));
+  const seg = ([a, b, x, y]) => { c.beginPath(); c.moveTo(a, b); c.lineTo(x, y); c.stroke(); };
+  if (tr) { c.strokeStyle = '#f0f'; c.lineWidth = 4; tr.forEach(seg); }
+  c.strokeStyle = 'rgba(255,128,0,0.7)'; c.lineWidth = 3; reds.forEach(seg);
+  c.fillStyle = '#fff'; path.forEach(([x, y]) => c.fillRect(x - 4, y - 4, 8, 8));
   c.fillStyle = '#0ff'; c.fillRect(478, 0, 4, 540);
 }"""
 
@@ -115,17 +150,16 @@ def main(seconds=120):
         pg.wait_for_function("window.unityInstance", timeout=90000)
         pg.wait_for_timeout(6000)
 
-        held, runs, run_start, last_click = None, 0, None, 0
+        held, runs, run_start, last_click, react = None, 0, None, 0, False
         t0 = time.time()
         while time.time() - t0 < seconds:
-            s = pg.evaluate(SENSE)
-            if s["black"] > 0.78:  # menu / game over (menu measures ~0.845)
+            s = pg.evaluate(SENSE, react)
+            if s["over"] or (run_start is None and s["black"] > 0.78):  # GAMEOVER, or menu before a run
                 if held: pg.keyboard.up(held); held = None
-                if run_start and time.time() - run_start < 0.5:
-                    run_start = None  # dark transition frame, not a real run
-                if run_start:
+                if run_start and s["over"]:
                     runs += 1
-                    print(f"run {runs}: {time.time() - run_start:.1f}s")
+                    sw = f"bot from {react_at - run_start:.1f}s" if react else "never reached score 1"
+                    print(f"run {runs}: {time.time() - run_start:.1f}s ({sw})")
                     pg.screenshot(path=f"deaths/run{runs:03d}.png")
                     run_start = None
                 if time.time() - last_click > 1.5:
@@ -133,18 +167,20 @@ def main(seconds=120):
                     last_click = time.time()
                 continue
             now = time.time()
-            if run_start is None: run_start = now; ticks = 0; prev = (now, s["near"])
+            if run_start is None: run_start = now; ticks = 0; prev = (now, s["near"]); react = False
             ticks += 1
+            # phase 1: roll straight (predictable) until score shows 1; phase 2: reactive bot
+            if not react and s["score1"]: react, react_at = True, now; print(f"  score 1 at {now - run_start:.1f}s -> reactive bot on")
             # PD: ball keeps lateral momentum, so counter-steer on how fast the corridor drifts past us
             dt = max(now - prev[0], 1e-3)
             vel = (s["near"] - prev[1]) / dt
             prev = (now, s["near"])
             u = s["err"] + KD * vel
-            steer = 0 if abs(u) < DEAD else (1 if u > 0 else -1)
+            steer = 0 if NOSTEER or not react or abs(u) < DEAD else (1 if u > 0 else -1)
             if DEBUG and runs < 6:
                 pg.evaluate(OVERLAY, s["ov"])
                 pg.screenshot(path=f"exp/r{runs}_{ticks:03d}.jpg", type="jpeg", quality=60)
-            if ticks % 15 == 0: print(f"  t={time.time() - run_start:4.1f} err={s['err']:+.0f} track={s['track']}/{s['nt']} block={s['block']}")
+            if ticks % 15 == 0: print(f"  t={time.time() - run_start:4.1f} err={s['err']:+.0f} track={s['track']}/{s['nt']} tunnel={s['tunnel']} tilt={s['th']} block={s['block']}")
             want = {-1: "ArrowLeft", 1: "ArrowRight", 0: None}[steer]
             if want != held:
                 if held: pg.keyboard.up(held)
