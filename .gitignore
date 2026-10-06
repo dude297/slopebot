@@ -1,0 +1,5 @@
+frames/
+deaths/
+exp/
+*.png
+__pycache__/
