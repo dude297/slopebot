@@ -142,6 +142,8 @@ SENSE = f"""(REACT) => {{
 DEBUG = os.environ.get("DEBUG") == "1"
 KD = float(os.environ.get("KD", 0.15))   # seconds of look-ahead on lateral drift; tune per run
 DEAD = float(os.environ.get("DEAD", 3))  # deadband in err units
+GATE = os.environ.get("GATE", "1") == "1"        # confidence-gated steering (GATE=0: old behaviour, for A/B)
+GATE_NT = int(os.environ.get("GATE_NT", 8))     # min crossbar points for a trusted road fit
 # draws both boundaries over the game: magenta = track edges, orange = padded obstacles, white = path
 OVERLAY = """({path, reds, tr}) => {
   let o = document.querySelector('#dbg');
@@ -188,7 +190,7 @@ class Telemetry:
         dirty = bool(subprocess.run(["git", "status", "--porcelain", "bot.py"], capture_output=True, text=True).stdout.strip())
         with open(os.path.join(self.dir, "session.json"), "w") as f:
             json.dump({"session_id": self.sid, "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "commit": commit + ("-dirty" if dirty else ""),
-                       "params": {"KD": KD, "DEAD": DEAD, "NOSTEER": NOSTEER, "DEBUG": DEBUG, "HUMAN": HUMAN}, "viewport": [960, 540]}, f, indent=1)
+                       "params": {"KD": KD, "DEAD": DEAD, "GATE": GATE, "GATE_NT": GATE_NT, "NOSTEER": NOSTEER, "DEBUG": DEBUG, "HUMAN": HUMAN}, "viewport": [960, 540]}, f, indent=1)
         self.f = None
 
     def start(self, run):
@@ -264,6 +266,11 @@ def main(seconds=120):
             prev = (now, s["near"])
             u = s["err"] + KD * vel
             bot_cmd = 0 if abs(u) < DEAD else (1 if u > 0 else -1)  # what the controller wants
+            # confidence gate: deaths came from steering on 2-4 point fits / tunnel walls / stale track
+            # (session 20261006-185151). Steer only on a fresh fit with >= GATE_NT crossbar points or a
+            # real (non-tunnel) red obstacle ahead; otherwise roll straight like the no-steer baseline.
+            conf = (s["track"] and s["track_age"] == 0 and s["nt"] >= GATE_NT) or (s["block"] >= 0 and not s["tunnel"])
+            if GATE and not conf: bot_cmd = 0
             steer = 0 if HUMAN or NOSTEER or not react else bot_cmd
             if DEBUG and runs < 6:
                 pg.evaluate(OVERLAY, s["ov"])
@@ -276,7 +283,7 @@ def main(seconds=120):
                 held = want
             tel.tick({"i": ticks, "t": round(now - run_start, 3), "phase": "human" if HUMAN else "react" if react else "straight",
                       "err": round(s["err"], 2), "near": round(s["near"], 2), "vel": round(vel, 2), "u": round(u, 2),
-                      "cmd": s["hk"] if HUMAN else steer, "bot_cmd": bot_cmd,
+                      "cmd": s["hk"] if HUMAN else steer, "bot_cmd": bot_cmd, "conf": conf,
                       "track": s["track"], "track_age": s["track_age"], "nt": s["nt"], "tunnel": s["tunnel"], "block": s["block"],
                       "road": s["road"], "frozen": s["frozen"], "black": round(s["black"], 3), "sense_ms": round(s["sense_ms"], 2),
                       "loop_ms": round((time.time() - last_tick) * 1000, 1)})
