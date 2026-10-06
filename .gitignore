@@ -4,3 +4,4 @@ exp/
 *.png
 __pycache__/
 telemetry/
+!fixtures/img/*.png
