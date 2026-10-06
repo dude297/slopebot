@@ -142,7 +142,7 @@ SENSE = f"""(REACT) => {{
 DEBUG = os.environ.get("DEBUG") == "1"
 KD = float(os.environ.get("KD", 0.15))   # seconds of look-ahead on lateral drift; tune per run
 DEAD = float(os.environ.get("DEAD", 3))  # deadband in err units
-GATE = os.environ.get("GATE", "1") == "1"        # confidence-gated steering (GATE=0: old behaviour, for A/B)
+GATE = os.environ.get("GATE", "0") == "1"        # confidence-gated steering; A/B 20 runs: worse (median 11.06 vs 11.65)
 GATE_NT = int(os.environ.get("GATE_NT", 8))     # min crossbar points for a trusted road fit
 # draws both boundaries over the game: magenta = track edges, orange = padded obstacles, white = path
 OVERLAY = """({path, reds, tr}) => {
