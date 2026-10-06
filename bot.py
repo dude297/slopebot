@@ -47,7 +47,9 @@ SENSE = f"""(REACT) => {{
   // "1" = bar at x 472-488 with empty columns either side, on rows above (22,26) and below (62,66) the text
   const one = [22, 26, 62, 66].every(y => gw(y, 472, 489) >= 7 && gw(y, 440, 470) === 0 && gw(y, 491, 520) === 0);
   // GAMEOVER title text: ~120px green on rows 70/75 in x 320-640 (menu: 0, gameplay: <=32)
-  const over = black > 0.78 && gw(70, 320, 640) >= 90 && gw(75, 320, 640) >= 90;
+  // ...and nothing beside the title (tunnel ceiling arcs also hit rows 70/75 but fill x<300 / x>660)
+  let side = 0; for (let y = 60; y <= 110; y += 5) side += gw(y, 0, 300) + gw(y, 660, 960);
+  const over = black > 0.78 && gw(70, 320, 640) >= 90 && gw(75, 320, 640) >= 90 && side < 20;
 
   const px = (u, v, th) => {{ const c = Math.cos(th), s = Math.sin(th); return [BX + u*c - v*s, BY + u*s + v*c]; }};
   // runs along the rotated scanline at offset v, in u coords
@@ -217,15 +219,16 @@ def main(seconds=120):
         pg.wait_for_function("window.unityInstance", timeout=90000)
         pg.wait_for_timeout(6000)
 
-        held, runs, run_start, last_click, react, ticks = None, 0, None, 0, False, 0
+        held, runs, run_start, last_click, react, ticks, over_n = None, 0, None, 0, False, 0, 0
         t0 = last_tick = time.time()
         while time.time() - t0 < seconds and not (RUNS and runs >= RUNS):
             tick_start = time.time()
             rt = tick_start - run_start if run_start else 0.0
             s = pg.evaluate(TICK, {"react": react, "ring": run_start is not None and ticks % RING_EVERY == 0, "i": ticks, "t": round(rt, 3)})
-            if s["over"] or (run_start is None and s["black"] > 0.78):  # GAMEOVER, or menu before a run
+            over_n = over_n + 1 if s["over"] else 0  # GAMEOVER is static: require 3 ticks in a row
+            if over_n >= 3 or (run_start is None and s["black"] > 0.78):  # GAMEOVER, or menu before a run
                 if held: pg.keyboard.up(held); held = None
-                if run_start and s["over"]:
+                if run_start and over_n >= 3:
                     runs += 1
                     sw = f"bot from {react_at - run_start:.1f}s" if react else "never reached score 1"
                     print(f"run {runs}: {time.time() - run_start:.1f}s ({sw})")

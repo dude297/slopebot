@@ -1,8 +1,58 @@
 [
-  {"image": "img/s0_menu.png", "expect": {"over": false, "black": [0.78, 1]}},
-  {"image": "img/f040.jpg", "expect": {"over": true}},
-  {"image": "img/s4.png", "expect": {"score1": true, "over": false}},
-  {"image": "img/s5.png", "expect": {"score1": false, "over": false}},
-  {"image": "img/f010.jpg", "expect": {"over": false, "tunnel": true, "road": true}},
-  {"image": "img/f025.jpg", "react": 1, "expect": {"over": false, "road": true, "block": [0, 100]}}
+ {
+  "image": "img/s0_menu.png",
+  "expect": {
+   "over": false,
+   "black": [
+    0.78,
+    1
+   ]
+  }
+ },
+ {
+  "image": "img/f040.jpg",
+  "expect": {
+   "over": true
+  }
+ },
+ {
+  "image": "img/s4.png",
+  "expect": {
+   "score1": true,
+   "over": false
+  }
+ },
+ {
+  "image": "img/s5.png",
+  "expect": {
+   "score1": false,
+   "over": false
+  }
+ },
+ {
+  "image": "img/f010.jpg",
+  "expect": {
+   "over": false,
+   "tunnel": true,
+   "road": true
+  }
+ },
+ {
+  "image": "img/f025.jpg",
+  "react": 1,
+  "expect": {
+   "over": false,
+   "road": true,
+   "block": [
+    0,
+    100
+   ]
+  }
+ },
+ {
+  "image": "img/tunnel_false_gameover.png",
+  "expect": {
+   "over": false
+  }
+ }
 ]
