@@ -83,6 +83,19 @@ def classify(ticks):
     return "unknown", f"block {b:.0%} lost {lost:.0%} rev {rev} bad {bad:.0%}"
 
 
+def freeze_onset(ticks, min_s=0.5):
+    """start t of the last run of frozen=true ticks lasting >= min_s, else None."""
+    start = onset = None
+    for k in ticks:
+        if k.get("frozen"):
+            start = k["t"] if start is None else start
+            if k["t"] - start >= min_s:
+                onset = start
+        else:
+            start = None
+    return onset
+
+
 def load(d):
     sess = {}
     try:
@@ -99,8 +112,13 @@ def load(d):
         n = int(m.group(1))
         ticks = read_jsonl(p)
         s = summ.get(n, {})
+        # the game freezes the last frame >2.5 s before GAMEOVER: survival and the death window end
+        # at freeze onset (death_t), otherwise the "last 2 s" is all post-death frozen frames
+        dt = s.get("death_t") or freeze_onset(ticks)
+        if dt is not None:
+            ticks = [k for k in ticks if k["t"] < dt] or ticks
         react = [k for k in ticks if k.get("phase") == "react"]
-        dur = s.get("duration", ticks[-1]["t"] if ticks else 0.0)
+        dur = dt if dt is not None else s.get("duration", ticks[-1]["t"] if ticks else 0.0)
         ra = s["react_at"] if "react_at" in s else (react[0]["t"] if react else None)
         end = s.get("end", "gameover")
         cat, ev = ("survived", "timeout") if end == "timeout" else classify(ticks)

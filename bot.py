@@ -38,9 +38,16 @@ SENSE = f"""(REACT) => {{
   const g2 = C.getContext('2d', {{willReadFrequently: true}});
   g2.drawImage(src, 0, 0, 960, 540);
   const d = g2.getImageData(0, 0, 960, 540).data;
-  let black = 0, n = 0;
-  for (let i = 0; i < d.length; i += 64) {{ n++; if (d[i] + d[i+1] + d[i+2] < 40) black++; }}
+  // on death the game freezes the last frame for >2.5 s before GAMEOVER (with slight blur jitter):
+  // frozen = <1% of sampled pixels changed by >40 since the previous tick
+  const NS = d.length >> 6, prev = window._prev, cur = new Uint8Array(NS);
+  let black = 0, n = 0, chg = 0;
+  for (let i = 0, k = 0; i < d.length; i += 64, k++) {{
+    n++; if (d[i] + d[i+1] + d[i+2] < 40) black++;
+    cur[k] = d[i+1]; if (prev && Math.abs(cur[k] - prev[k]) > 40) chg++;
+  }}
   black /= n;
+  const frozen = !!prev && chg < 0.01 * n; window._prev = cur;
   const isR = i => d[i] > 150 && d[i+1] < 100, isG = i => d[i+1] > 150 && d[i] < 100;
   const gw = (y, a, b) => {{ let k = 0; for (let x = a; x < b; x++) if (isG((y*960 + x) * 4)) k++; return k; }};
   // score digit top-centre: row 25 is above the tutorial text. "1" = ~9px bar, "0"/"2".. = ~30px box
@@ -126,7 +133,7 @@ SENSE = f"""(REACT) => {{
   const tr = track ? [[...px(track[0](-LOOK), -LOOK, th), ...px(track[0](210), 210, th)],
                       [...px(track[1](-LOOK), -LOOK, th), ...px(track[1](210), 210, th)]] : null;
   const nearU = path.length ? (path[0][0] - BX) : 0;
-  return {{black, over, score1: one, err: target / U, near: nearU / U, block, track: !!track, tunnel, nt: pts.length,
+  return {{black, over, frozen, score1: one, err: target / U, near: nearU / U, block, track: !!track, tunnel, nt: pts.length,
           th: Math.round(th * 57.3), road: pts.length > 0 || anyRed,
           track_age: window._trk ? window._trk.age : null, sense_ms: performance.now() - T0, ov: {{path, reds, tr}}}};
 }}"""
@@ -153,12 +160,13 @@ OVERLAY = """({path, reds, tr}) => {
 RUNS = int(os.environ.get("RUNS", 0))   # stop after N finished runs (0 = run for `seconds`)
 # HUMAN=1: you play in the browser window, the bot only records (your keys -> cmd, phase "human")
 HUMAN = os.environ.get("HUMAN") == "1"
-# pre-death buffer: 40 frames every 2nd tick (~2.5 s); human demos keep every 3rd frame of the whole run
-RING_N, RING_EVERY = (100000, 3) if HUMAN else (40, 2)
+# pre-death buffer: 150 frames every 2nd tick (~6.5 s: death animations - fall/freeze - last 2-3 s);
+# human demos keep every 3rd frame of the whole run
+RING_N, RING_EVERY = (100000, 3) if HUMAN else (150, 2)
 
 # SENSE + rolling pre-death frame buffer (480x270 jpeg, in page) in one round trip
 TICK = "(a) => { const s = (" + SENSE + """)(a.react);
-  if (a.ring) { const src = document.querySelector('#unity-canvas');
+  if (a.ring && !s.frozen) { const src = document.querySelector('#unity-canvas');
     const c = window._rc || (window._rc = Object.assign(document.createElement('canvas'), {width: 480, height: 270}));
     c.getContext('2d').drawImage(src, 0, 0, 480, 270);
     const r = window._ring || (window._ring = []); r.push([a.i, a.t, c.toDataURL('image/jpeg', 0.6)]);
@@ -194,7 +202,7 @@ class Telemetry:
         if rec["cmd"] and self.last_cmd and rec["cmd"] != self.last_cmd: self.reversals += 1
         if rec["cmd"]: self.last_cmd = rec["cmd"]
 
-    def end(self, pg, duration, react_at, how):
+    def end(self, pg, duration, react_at, how, death_t=None):
         self.f.close(); self.f = None
         pre = os.path.join(self.dir, f"run_{self.run:03d}_pre"); os.makedirs(pre, exist_ok=True)
         idx = []
@@ -204,7 +212,7 @@ class Telemetry:
         with open(os.path.join(pre, "index.json"), "w") as f: json.dump(idx, f)
         if how == "gameover": pg.screenshot(path=os.path.join(self.dir, f"run_{self.run:03d}_death.png"))
         with open(os.path.join(self.dir, "summary.jsonl"), "a") as f:
-            f.write(json.dumps({"run": self.run, "duration": round(duration, 3), "react_at": react_at, "ticks": self.rows, "end": how,
+            f.write(json.dumps({"run": self.run, "duration": round(duration, 3), "react_at": react_at, "ticks": self.rows, "end": how, "death_t": death_t,
                                 "mean_loop_ms": round(self.loop_sum / max(self.rows, 1), 2), "reversals": self.reversals}) + "\n")
 
 
@@ -232,7 +240,7 @@ def main(seconds=120):
                     runs += 1
                     sw = f"bot from {react_at - run_start:.1f}s" if react else "never reached score 1"
                     print(f"run {runs}: {time.time() - run_start:.1f}s ({sw})")
-                    tel.end(pg, time.time() - run_start, round(react_at - run_start, 3) if react else None, "gameover")
+                    tel.end(pg, time.time() - run_start, round(react_at - run_start, 3) if react else None, "gameover", round(dead_at - run_start, 3) if dead_at else None)
                     run_start = None
                 if time.time() - last_click > 1.5:
                     pg.mouse.click(480, 310, delay=100)
@@ -240,11 +248,14 @@ def main(seconds=120):
                 continue
             now = time.time()
             if run_start is None:
+                freeze_at = dead_at = None
                 run_start = now; ticks = 0; prev = (now, s["near"]); react = HUMAN  # human: full sensing from t=0
                 if HUMAN: react_at = now
                 pg.evaluate("() => { window._ring = []; window._trk = null; }")
                 tel.start(runs + 1)
             ticks += 1
+            freeze_at = (freeze_at or now) if s["frozen"] else None
+            if freeze_at and now - freeze_at >= 0.5: dead_at = freeze_at  # frozen >= 0.5 s = ball died at freeze onset
             # phase 1: roll straight (predictable) until score shows 1; phase 2: reactive bot
             if not react and s["score1"]: react, react_at = True, now; print(f"  score 1 at {now - run_start:.1f}s -> reactive bot on")
             # PD: ball keeps lateral momentum, so counter-steer on how fast the corridor drifts past us
@@ -267,7 +278,7 @@ def main(seconds=120):
                       "err": round(s["err"], 2), "near": round(s["near"], 2), "vel": round(vel, 2), "u": round(u, 2),
                       "cmd": s["hk"] if HUMAN else steer, "bot_cmd": bot_cmd,
                       "track": s["track"], "track_age": s["track_age"], "nt": s["nt"], "tunnel": s["tunnel"], "block": s["block"],
-                      "road": s["road"], "black": round(s["black"], 3), "sense_ms": round(s["sense_ms"], 2),
+                      "road": s["road"], "frozen": s["frozen"], "black": round(s["black"], 3), "sense_ms": round(s["sense_ms"], 2),
                       "loop_ms": round((time.time() - last_tick) * 1000, 1)})
             last_tick = time.time()
         if run_start:  # session ended mid-run
